@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Hunter Pro Dashboard</title>
+    <link rel="stylesheet" href="/style.css">
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+
+<div class="container">
+    <!-- Header -->
+    <header class="glass-header">
+        <div class="logo-area">
+            <span class="emoji-icon">💎</span>
+            <h1>HUNTER<span class="accent">PRO</span></h1>
+        </div>
+        <button id="close-btn" class="icon-btn">✕</button>
+    </header>
+
+    <!-- Live Stats -->
+    <section class="stats-grid">
+        <div class="stat-card glass-card animate-fade-up delay-1">
+            <div class="stat-value" id="val-checked">0</div>
+            <div class="stat-label">Checked</div>
+        </div>
+        <div class="stat-card glass-card highlight animate-fade-up delay-2">
+            <div class="stat-value" id="val-found">0</div>
+            <div class="stat-label">Found 💎</div>
+        </div>
+        <div class="stat-card glass-card animate-fade-up delay-3">
+            <div class="stat-value" id="val-status">OFF</div>
+            <div class="stat-label">Status</div>
+        </div>
+    </section>
+
+    <!-- Control Panel -->
+    <section class="control-panel glass-card animate-fade-up delay-4">
+        <h3>⚡ Auto Hunt</h3>
+        <p class="hint">Start background hunting for rare nicknames</p>
+        
+        <div class="action-buttons">
+            <button onclick="sendCommand('/on')" class="btn-primary">🚀 Start Search</button>
+            <button onclick="sendCommand('/off')" class="btn-secondary">🛑 Stop</button>
+        </div>
+    </section>
+
+    <!-- VIP Watchlist -->
+    <section class="vip-section glass-card animate-fade-up delay-5">
+        <h3>👁️ VIP Monitor</h3>
+        <p class="hint">Track expensive usernames</p>
+        <div class="vip-list" id="vip-container">
+            <div class="empty-state">Loading...</div>
+        </div>
+        <button onclick="openAddModal()" class="btn-outline">➕ Add Name</button>
+    </section>
+
+</div>
+
+<!-- Modal -->
+<div id="modal" class="modal hidden">
+    <div class="modal-content glass-card">
+        <h3>Add to VIP</h3>
+        <input type="text" id="vip-input" placeholder="@username" autocomplete="off">
+        <div class="modal-actions">
+            <button onclick="closeModal()" class="btn-cancel">Cancel</button>
+            <button onclick="submitVip()" class="btn-primary">Add</button>
+        </div>
+    </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

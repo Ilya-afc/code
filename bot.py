@@ -20,9 +20,8 @@ SUBS_FILE = "subs.json"
 REF_FILE = "referrals.json"
 
 # ⚙️ НАСТРОЙКИ
-AUTO_STOP_LIMIT = 7      # Автостоп после 7 найденных юзов
-NIGHT_PAUSE = 4          # Пауза для ночи (секунды)
-DAY_PAUSE = 2            # Пауза для дня (секунды)
+NIGHT_PAUSE = 12       # 12 секунд = 100% безопасно
+AUTO_STOP_LIMIT = 9999 # Фактически безлимитно
 
 client = TelegramClient('session', API_ID, API_HASH)
 crypto_session = None
@@ -34,7 +33,7 @@ auto_on = False
 auto_found_count = 0
 _last_chk = 0
 app_global = None
-current_pause = DAY_PAUSE
+current_pause = NIGHT_PAUSE
 
 PLANS = {
     "1h":   {"name": "1 час",     "rub": 10,  "stars": 5,   "delta": timedelta(hours=1)},
@@ -107,7 +106,7 @@ found = load(FOUND_FILE)
 subs = load(SUBS_FILE)
 referrals = load(REF_FILE)
 
-LINE = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
+LINE = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
 
 async def reply(u, text, kb=None):
     if len(text) > 4000: text = text[:4000] + "\n…(обрезано)"
@@ -148,15 +147,15 @@ def sub_status(uid):
     if str(uid) == str(OWNER_ID): return "👑 <b>Владелец (безлимит)</b>"
     v = subs.get(str(uid))
     if not v: return "❌ <b>Нет подписки</b>\n💎 Оформить: /subscribe"
-    if v == "lifetime": return "💎 <b>Lifetime (навсегда)</b>"
+    if v == "lifetime": return " <b>Lifetime (навсегда)</b>"
     try:
         d = datetime.fromisoformat(v)
         left = d - datetime.now()
-        if left.total_seconds() <= 0: return "❌ <b>Истекла</b>\n💎 Продлить: /subscribe"
+        if left.total_seconds() <= 0: return " <b>Истекла</b>\n💎 Продлить: /subscribe"
         days = left.days
         hours = left.seconds // 3600
         minutes = (left.seconds % 3600) // 60
-        return f"⏳ <b>Осталось: {days}д {hours}ч {minutes}м</b>\n Истекает: {d.strftime('%d.%m.%Y %H:%M')}"
+        return f"⏳ <b>Осталось: {days}д {hours}ч {minutes}м</b>\n💎 Истекает: {d.strftime('%d.%m.%Y %H:%M')}"
     except: return "❓ <b>Неизвестно</b>"
 
 def generate_captcha():
@@ -232,7 +231,7 @@ def kb(uid):
     rows = [
         [InlineKeyboardButton("🎲 Генератор", callback_data="gen"), InlineKeyboardButton("🔄 Авто-проверка 5 шт", callback_data="autocheck")],
         [InlineKeyboardButton("💎 Подписка", callback_data="sub"), InlineKeyboardButton("📊 Профиль", callback_data="profile")],
-        [InlineKeyboardButton("💎 Мои находки", callback_data="myfound"), InlineKeyboardButton("👥 Рефералы", callback_data="ref")],
+        [InlineKeyboardButton("💎 Мои находки", callback_data="myfound"), InlineKeyboardButton(" Рефералы", callback_data="ref")],
     ]
     if uid == OWNER_ID and not auto_on:
         rows.append([InlineKeyboardButton("🚀 Автостарт", callback_data="auto")])
@@ -248,26 +247,23 @@ def plans_kb():
     return InlineKeyboardMarkup(rows)
 
 def pay_method_kb(plan):
-    return InlineKeyboardMarkup([[InlineKeyboardButton("💳 CryptoBot", callback_data=f"m_crypto_{plan}"), InlineKeyboardButton("⭐ Stars", callback_data=f"m_stars_{plan}")], [InlineKeyboardButton("◀️ Назад", callback_data="sub")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton(" CryptoBot", callback_data=f"m_crypto_{plan}"), InlineKeyboardButton("⭐ Stars", callback_data=f"m_stars_{plan}")], [InlineKeyboardButton("◀️ Назад", callback_data="sub")]])
 
 def profile_kb(uid):
     if uid == OWNER_ID:
-        return InlineKeyboardMarkup([[InlineKeyboardButton("️ Назад", callback_data="back")]])
+        return InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="back")]])
     return InlineKeyboardMarkup([[InlineKeyboardButton("💎 Оформить", callback_data="sub")], [InlineKeyboardButton("◀️ Назад", callback_data="back")]])
 
 def ref_kb(uid):
     stats = get_ref_stats(uid)
     link = f"https://t.me/{app_global.bot.username}?start={stats['code']}" if stats else f"https://t.me/{app_global.bot.username}?start=ref"
-    return InlineKeyboardMarkup([[InlineKeyboardButton("📋 Скопировать", url=link)], [InlineKeyboardButton("◀️ Назад", callback_data="back")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton(" Скопировать", url=link)], [InlineKeyboardButton("◀️ Назад", callback_data="back")]])
 
 def found_filter_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⭐ Все", callback_data="filter_all"), InlineKeyboardButton("💎 6 букв", callback_data="filter_6")],
         [InlineKeyboardButton("🔥 5 букв", callback_data="filter_5"), InlineKeyboardButton("◀️ Назад", callback_data="back")]
     ])
-
-def rate_kb(username):
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⭐ Оценить", callback_data=f"rate_{username}")], [InlineKeyboardButton("◀️ Назад", callback_data="myfound")]])
 
 # ═══════════ БЫСТРАЯ ПРОВЕРКА ═══════════
 async def init_http():
@@ -291,7 +287,7 @@ async def check1(n):
     except:
         return None
 
-# ══════════ CRYPTOBOT ═══════════
+# ═══════════ CRYPTOBOT ═══════════
 async def crypto_init():
     global crypto_session
     if not CRYPTO_BOT_TOKEN:
@@ -360,7 +356,7 @@ async def start(u,c):
                 msg = f"👋 <b>Привет!</b>\n\n🤖 <b>Проверка на бота:</b>\nРешите пример: <code>{question} = ?</code>\n\nПросто отправьте ответ числом. У вас 3 попытки!"
                 await reply(u, msg)
                 try:
-                    await app_global.bot.send_message(owner_id, f"🔔 <b>Новый реферал!</b>\nПользователь {uid} ожидает капчу.", parse_mode="HTML")
+                    await app_global.bot.send_message(owner_id, f" <b>Новый реферал!</b>\nПользователь {uid} ожидает капчу.", parse_mode="HTML")
                 except: pass
                 return
 
@@ -377,7 +373,7 @@ async def gen(u,c):
         try: n=max(1,min(20,int(c.args[0])))
         except: pass
     if not is_sub(u.effective_user.id) and n > 5:
-        await reply(u, f" <b>Нужна подписка</b>\nБез подписки доступно 5 юзов.")
+        await reply(u, f"🔒 <b>Нужна подписка</b>\nБез подписки доступно 5 юзов.")
         n = 5
     await reply(u, do_gen(n))
 
@@ -385,7 +381,7 @@ async def check(u,c):
     global _last_chk
     if not c.args: return await reply(u,"🔍 Укажи юз: /check flouroo")
     uid=u.effective_user.id; now=time.time()
-    if now-cooldown.get(uid,0)<USER_COOLDOWN:=8:
+    if now-cooldown.get(uid,0)<8:
         return await reply(u,f"⏳ Подожди {int(8-(now-cooldown[uid]))} сек")
     n=c.args[0].lstrip("@").lower()
     if not re.fullmatch(r"[a-z0-9_]{4,32}",n):
@@ -394,20 +390,20 @@ async def check(u,c):
     _last_chk=time.time()
     m = await reply(u, f"🔍 Проверяю @{n}...")
     f = await check1(n)
-    txt = f" <b>@{n}</b> — СВОБОДЕН!" if f else (f"⚪️ Ошибка" if f is None else f"🔴 <b>@{n}</b> — ЗАНЯТ")
+    txt = f"🟢 <b>@{n}</b> — СВОБОДЕН!" if f else (f"⚪️ Ошибка" if f is None else f" <b>@{n}</b> — ЗАНЯТ")
     await m.edit_text(txt, parse_mode="HTML")
 
 async def subscribe(u,c): await reply(u, f"💎 Тарифы:\n{LINE}", plans_kb())
 
 async def profile(u,c):
     uid = u.effective_user.id
-    await reply(u, f"📊 <b>Профиль</b>\n{LINE}\n👤 ID: <code>{uid}</code>\n\n{sub_status(uid)}", profile_kb(uid))
+    await reply(u, f" <b>Профиль</b>\n{LINE}\n👤 ID: <code>{uid}</code>\n\n{sub_status(uid)}", profile_kb(uid))
 
 async def myfound(u,c):
     if u.effective_user.id != OWNER_ID:
         await reply(u, do_found())
     else:
-        await reply(u, f" <b>Мои находки: {len(found)}</b>\n{LINE}\nНажми фильтр для сортировки.", found_filter_kb())
+        await reply(u, f"💎 <b>Мои находки: {len(found)}</b>\n{LINE}\nНажми фильтр для сортировки.", found_filter_kb())
 
 async def ref(u,c):
     uid = u.effective_user.id
@@ -416,17 +412,16 @@ async def ref(u,c):
         code = get_ref_code(uid)
         stats = get_ref_stats(uid)
     link = f"https://t.me/{app_global.bot.username}?start={stats['code']}"
-    text = f" <b>Рефералка</b>\n{LINE}\n⏰ +1 час за друга!\n\n📊 Статистика:\n• Приглашено: <b>{stats['invited_count']}</b>\n• Ожидают капчу: <b>{stats.get('pending_count', 0)}</b>\n• Заработано: <b>{stats['total_earned']} ч</b>\n\n📎 Ссылка:\n<code>{link}</code>"
+    text = f"👥 <b>Рефералка</b>\n{LINE}\n⏰ +1 час за друга!\n\n📊 Статистика:\n• Приглашено: <b>{stats['invited_count']}</b>\n• Ожидают капчу: <b>{stats.get('pending_count', 0)}</b>\n• Заработано: <b>{stats['total_earned']} ч</b>\n\n📎 Ссылка:\n<code>{link}</code>"
     await reply(u, text, ref_kb(uid))
 
 @only
 async def setpause(u,c):
-    """Установка паузы для автостарта"""
+    global current_pause
     if not c.args:
-        await reply(u, f"⚙️ <b>Текущая пауза:</b> {current_pause} сек\n\nИспользование:\n<code>/setpause 3</code> — быстро\n<code>/setpause 8</code> — медленно (ночь)")
+        await reply(u, f"⚙️ <b>Текущая пауза:</b> {current_pause} сек\n\nИспользование:\n<code>/setpause 12</code> — ночь (безопасно)\n<code>/setpause 6</code> — день (быстрее)")
         return
     try:
-        global current_pause
         current_pause = int(c.args[0])
         await reply(u, f"✅ Пауза установлена: <b>{current_pause} сек</b>")
     except:
@@ -434,7 +429,6 @@ async def setpause(u,c):
 
 @only
 async def rate(u,c):
-    """Оценка юза"""
     if not c.args:
         await reply(u, "📊 <b>Оценка юза:</b>\n<code>/rate username</code>")
         return
@@ -465,13 +459,13 @@ async def autostart(u,c):
     if auto_on: return await reply(u,"⚠️ Уже запущен")
     auto_on = True
     auto_found_count = 0
-    await reply(u, f"🚀 <b>Автостарт запущен!</b>\n Пауза: {current_pause} сек\n🛑 Остановится после {AUTO_STOP_LIMIT} находок", auto_stop_kb())
+    await reply(u, f"🚀 <b>Автостарт запущен!</b>\n⏸ Пауза: {current_pause} сек\n♾️ Работает бесконечно", auto_stop_kb())
 
 @only
 async def autostop(u,c):
     global auto_on
     auto_on = False
-    await reply(u, f"🛑 <b>Автостоп</b>\n Найдено за сессию: {auto_found_count}\n📂 Всего в базе: {len(found)}")
+    await reply(u, f"🛑 <b>Автостоп</b>\n Найдено за сессию: {auto_found_count}\n📊 Всего в базе: {len(found)}")
 
 @only
 async def give(u,c):
@@ -484,7 +478,7 @@ async def give(u,c):
     except Exception as e:
         return await reply(u,f"❌ Не нашёл: {e}")
     grant(uid, plan)
-    await reply(u,f" Выдано @{uname} → {PLANS[plan]['name']}")
+    await reply(u,f"🎁 Выдано @{uname} → {PLANS[plan]['name']}")
 
 async def handle_captcha(u,c):
     uid = u.effective_user.id
@@ -504,12 +498,12 @@ async def handle_captcha(u,c):
 
 # ═══════════ CALLBACK ═══════════
 async def cb(u,c):
-    global auto_on, auto_found_count, current_pause
+    global auto_on, auto_found_count
     q=u.callback_query
     data=q.data
     uid=u.effective_user.id
     
-    # ⚡ МГНОВЕННЫЙ ОТВЕТ (кнопки не лагают)
+    # ⚡ МГНОВЕННЫЙ ОТВЕТ
     await q.answer()
     
     # Проверка капчи
@@ -577,13 +571,6 @@ async def cb(u,c):
         text = f"💎 <b>Фильтр: {ftype}</b>\n{LINE}\n" + "\n".join(f"<code>@{w}</code> · {len(w)}б · ⭐ {score(w)}" for w in filtered) if filtered else "Пусто"
         await q.message.reply_text(text, parse_mode="HTML", reply_markup=found_filter_kb())
         
-    elif data.startswith("rate_"):
-        if uid != OWNER_ID: return
-        username = data[5:]
-        s = score(username)
-        rating = "💎 РЕДКИЙ" if s >= 8 else ("✨ Хороший" if s >= 5 else "⚪️ Обычный")
-        await q.message.reply_text(f"📊 <b>@{username}</b>\n{LINE}\n• Длина: {len(username)}\n• Оценка: {s}/10\n• Статус: {rating}", parse_mode="HTML", reply_markup=rate_kb(username))
-        
     elif data.startswith("pay_"):
         plan=data[4:]; p=PLANS[plan]
         await q.message.reply_text(f"💎 {p['name']} — {p['rub']}₽", reply_markup=pay_method_kb(plan))
@@ -609,7 +596,7 @@ async def cb(u,c):
         auto_on = not auto_on
         auto_found_count = 0
         if auto_on:
-            await q.message.reply_text(f"🚀 <b>Автостарт ВКЛ</b>\nПауза: {current_pause} сек\nСтоп после {AUTO_STOP_LIMIT} находок", reply_markup=auto_stop_kb())
+            await q.message.reply_text(f"🚀 <b>Автостарт ВКЛ</b>\n⏸ Пауза: {current_pause} сек\n♾️ Работает бесконечно", reply_markup=auto_stop_kb())
         else:
             await q.message.reply_text("🛑 <b>Автостоп</b>", reply_markup=kb(uid))
 
@@ -648,12 +635,6 @@ async def searcher(app):
                 s = score(cand)
                 tag = "💎 РЕДКИЙ!" if s >= 8 else ("✨" if s >= 5 else "")
                 await app.bot.send_message(OWNER_ID, f"{tag} <code>@{cand}</code> ({len(cand)}б) · ⭐ {s}", parse_mode="HTML")
-                
-                # 🛑 АВТОСТОП ПОСЛЕ 7 НАХОДОК
-                if auto_found_count >= AUTO_STOP_LIMIT:
-                    auto_on = False
-                    await app.bot.send_message(OWNER_ID, f"🛑 <b>Автостоп!</b>\nНайдено {AUTO_STOP_LIMIT} юзов за сессию.\nЗапусти /autostart для продолжения.", parse_mode="HTML", reply_markup=kb(OWNER_ID))
-                    
             await asyncio.sleep(current_pause)
         else:
             await asyncio.sleep(2)
@@ -685,8 +666,8 @@ async def main():
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     await app.initialize(); await app.start(); await app.updater.start_polling()
     print("🚀 Бот запущен")
-    print(f"⚙️ Автостоп после: {AUTO_STOP_LIMIT} находок")
-    print(f"⏸ Пауза: {current_pause} сек")
+    print(f"⏸ Пауза: {current_pause} сек (100% безопасно)")
+    print("♾️ Автостоп отключён — работает бесконечно")
     try:
         await asyncio.gather(monitor(app), searcher(app), crypto_poller(app))
     finally:

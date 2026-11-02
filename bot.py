@@ -1,400 +1,226 @@
 import asyncio, os, json, random, time
 from dotenv import load_dotenv
-from telethon import TelegramClient, functions, types
+from aiohttp import web
+from telethon import TelegramClient
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+import aiohttp as aioclient # Alias for HTTP requests inside bot logic
 
-# ═══════════ КОНФИГУРАЦИЯ ═══════════
+# ═══════════ CONFIG ═══════════
 load_dotenv()
-
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = 6288011144
+PORT = 8080
 
-# Настройки безопасности и скорости
-MIN_DELAY = 1.5       # Минимальная пауза между запросами (сек)
-MAX_DELAY = 3.5       # Максимальная пауза (рандомизация против банофагов)
-BATCH_SIZE = 5        # Сколько проверять подряд перед большой паузой
-BIG_PAUSE = 10        # Пауза после BATCH_SIZE проверок
-
+# Files
 FOUND_FILE = "found_v2.json"
 WATCH_FILE = "watch_v2.json"
 
-# Глобальные состояния
-tg_client = None      # Telethon клиент (для API проверок)
+# State
+tg_client = None
+http_session = None
 auto_on = False
-vip_on = False
 check_counter = 0
-found_set = set()     # Используем set для быстрого поиска дубликатов
+found_set = set()
 watch_set = set()
 
-# ═══════════ ГЕНЕРАТОР ИМЕН ═══════════
-CONSONANTS = list("bcdfghjklmnprstvwz")
-VOWELS = ["a", "e", "i", "o", "u"]
-DIGRAPHS = ["ch", "sh", "th", "ph", "wh", "ck", "ng", "qu", "zz", "xx"]
+# Security Delays
+MIN_DELAY = 1.5
+MAX_DELAY = 3.5
+BATCH_SIZE = 5
+BIG_PAUSE = 10
 
-def generate_smart_name():
-    """Генерирует читаемое имя длиной 5-7 символов"""
-    length = random.randint(5, 7)
-    name = ""
+# ═══════════ DATA UTILS ═══════════
+def load_data():
+    global found_set, watch_set
+    if os.path.exists(FOUND_FILE):
+        with open(FOUND_FILE) as f: found_set = set(json.load(f))
     
-    # Паттерн: Согласная - Гласная - Согласная... или с диграфами
-    for i in range(length):
-        if i % 2 == 0: # Четные позиции (0, 2, 4...) -> Согласные
-            if random.random() < 0.2 and len(name) > 0: # Иногда добавляем диграф
-                name += random.choice(DIGRAPHS)
-            else:
-                name += random.choice(CONSONANTS)
-        else: # Нечетные позиции -> Гласные
-            name += random.choice(VOWELS)
-            
-    # Убираем лишние буквы если переборщили с диграфами
-    return name[:length].lower()
+    default_watch = ["admin", "crypto", "ton", "btc", "eth"]
+    if os.path.exists(WATCH_FILE):
+        with open(WATCH_FILE) as f: 
+            loaded = json.load(f)
+            watch_set = set(loaded) if loaded else set(default_watch)
+    else:
+        watch_set = set(default_watch)
+        save_watch()
 
-# ═══════════ ЯДРО ПРОВЕРКИ (TELETHON API) ═══════════
-async def check_username_telethon(username: str) -> bool:
-    """
-    Возвращает True если ЮЗ СВОБОДЕН, False если ЗАНЯТ.
-    Использует официальный метод GetUsernameAvailability.
-    """
-    global tg_client
-    if not tg_client or not tg_client.is_connected():
-        raise ConnectionError("Telethon client not connected")
-        
-    try:
-        # Этот метод возвращает список объектов UsernamePriceLevel или аналогичных
-        # Если username доступен, он вернет информацию о цене/доступности
-        # Если занят, часто выбрасывает исключение или возвращает пустой результат
-        
-        result = await tg_client(functions.account.CheckUsernameRequest(usernames=[username]))
-        
-        # Логика ответа Telegram:
-        # Если username занят, обычно приходит ошибка или флаг unavailable
-        # В новых версиях Telethon это может быть tuple или object
-        
-        # Простая эвристика: если функция прошла без исключения ValueError("USERNAME_INVALID") 
-        # и вернула данные, проверяем статус.
-        
-        # NOTE: CheckUsernameRequest возвращает Account.UsernamePrices? No.
-        # It returns Bool or specific structure depending on version.
-        # Actually, the most reliable way in recent Telethon is checking if it raises an error 
-        # OR using IsUsernameAvailable logic if exposed.
-        
-        # Let's use a safer approach often used by bots:
-        # Try to resolve entity. If fails with USER_NOT_FOUND, it might be free (or invalid format).
-        # But CheckUsername is better.
-        
-        # In standard Telethon:
-        # res = await client(functions.account.GetUsernameAvailabilityRequest(usernames=[username]))
-        # This doesn't exist directly as public API easily mapped sometimes.
-        
-        # ALTERNATIVE ROBUST METHOD:
-        # Use ResolveUsername. If it throws PeerIdInvalidError, the username is NOT TAKEN BY A PUBLIC PROFILE.
-        # However, reserved usernames also throw this.
-        
-        # Best Practice for "Hunter" bots without premium access:
-        # 1. Format check.
-        # 2. HTTP HEAD request to t.me/u (fastest non-API way, but cached).
-        # 3. Since we want ACCURACY: We will use the HTTP method BUT with cache-busting headers 
-        # AND verify critical finds via Telethon Entity Resolution.
-        
-        pass 
-        
-    except Exception as e:
-        print(f"API Error: {e}")
-        return False
+def save_found():
+    with open(FOUND_FILE, "w") as f: json.dump(list(found_set), f)
 
-# --- ВОЗВРАТ К НАДЕЖНОМУ МЕТОДУ (HYBRID) ---
-# Чистый API CheckUsername сложен в интерпретации ошибок разных версий.
-# Самый быстрый и точный способ для хантеров:
-# 1. Быстрая предфильтрация через HTTP (t.me/username).
-# 2. Подтверждение найденного через Telethon (чтобы исключить кэш).
+def save_watch():
+    with open(WATCH_FILE, "w") as f: json.dump(list(watch_set), f)
 
-http_session = None
+# ═══════════ GENERATOR & CHECKER ═══════════
+def gen_name():
+    c = list("bcdfghjklmnprstvwz"); v = ["a","e","i","o","u"]
+    l = random.randint(5,7); n=""
+    for i in range(l): n += random.choice(c) if i%2==0 else random.choice(v)
+    return n.lower()
 
 async def init_http():
     global http_session
     if not http_session:
-        import aiohttp
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 10; SM-G975F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36",
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0"
-        }
-        http_session = aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=3))
+        headers = {"User-Agent": "Mozilla/5.0", "Cache-Control": "no-cache"}
+        http_session = aioclient.ClientSession(headers=headers, timeout=aioclient.ClientTimeout(total=3))
 
-async def fast_check_http(username: str) -> bool:
-    """Быстрая предварительная проверка"""
+async def check_free_http(u):
     global http_session
     if not http_session: await init_http()
-    
-    url = f"https://t.me/{username}"
     try:
-        async with http_session.head(url, allow_redirects=False) as resp:
-            # 200 OK usually means page exists (Taken)
-            # 404 Not Found means page missing (Free?)
-            # 301/302 Redirect means taken
-            if resp.status == 404:
-                return True # Likely Free
-            elif resp.status == 200:
-                return False # Taken
-            else:
-                return False # Unknown/Taken
-    except:
-        return False
+        async with http_session.head(f"https://t.me/{u}", allow_redirects=False) as r:
+            return r.status == 404
+    except: return False
 
-async def verify_with_telethon(username: str) -> bool:
-    """Финальная проверка через MTProto (Исключает ложные срабатывания HTTP)"""
+async def verify_telethon(u):
     global tg_client
-    if not tg_client: return False
-    
+    if not tg_client or not tg_client.is_connected(): return False
     try:
-        # Пробуем найти пользователя по username
-        # Если его нет -> ValueError / PeerIdInvalid
-        await tg_client.get_entity(username)
-        return False # Найден -> Занят
+        await tg_client.get_entity(u)
+        return False # Taken
     except ValueError:
-        return True # Не найден -> Скорее всего свободен (или зарезервирован)
-    except Exception:
-        return False
+        return True # Free
+    except: return False
 
-# ═══════════ ОСНОВНОЙ ЦИКЛ ПОИСКА ═══════════
-async def hunter_loop(app):
+# ═══════════ BACKGROUND TASKS ═══════════
+async def hunter_loop(app_bot):
     global auto_on, check_counter, found_set
-    
     while True:
         if not auto_on:
-            await asyncio.sleep(2)
-            continue
-            
-        batch_count = 0
-        start_time = time.time()
+            await asyncio.sleep(2); continue
         
-        while batch_count < BATCH_SIZE and auto_on:
-            username = generate_smart_name()
+        batch = 0
+        while batch < BATCH_SIZE and auto_on:
+            u = gen_name()
+            if u in found_set: continue
             
-            # Пропускаем если уже нашли или пробовали
-            if username in found_set:
-                continue
-                
-            check_counter += 1
-            batch_count += 1
+            check_counter += 1; batch += 1
             
-            # Шаг 1: Быстрый HTTP скрининг
-            is_likely_free = await fast_check_http(username)
-            
-            if is_likely_free:
-                # Шаг 2: Верификация через Telethon (Защита от кэша)
-                is_actually_free = await verify_with_telethon(username)
-                
-                if is_actually_free:
-                    found_set.add(username)
+            is_free = await check_free_http(u)
+            if is_free:
+                verified = await verify_telethon(u)
+                if verified:
+                    found_set.add(u)
                     save_found()
-                    
-                    msg = f"💎 FOUND VERIFIED:\n@{username}\n\nTotal: {len(found_set)}"
-                    print(msg)
                     try:
-                        await app.bot.send_message(OWNER_ID, msg, parse_mode=ParseMode.HTML)
+                        await app_bot.bot.send_message(OWNER_ID, f"💎 NEW FIND:\n@{u}\nTotal: {len(found_set)}")
                     except: pass
-                    
-                    # После находки делаем небольшую паузу, чтобы перевести дух
-                    await asyncio.sleep(2) 
-                else:
-                    # Ложное срабатывание HTTP (кэш)
-                    pass 
             
-            # Троттлинг внутри батча
-            delay = random.uniform(MIN_DELAY, MAX_DELAY)
-            await asyncio.sleep(delay)
+            await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
             
-        # Большая пауза после батча
         if auto_on:
-            elapsed = time.time() - start_time
-            print(f"📊 Batch done. Time: {elapsed:.1f}s. Total checks: {check_counter}. Found: {len(found_set)}")
+            print(f"Batch Done. Checks: {check_counter}")
             await asyncio.sleep(BIG_PAUSE)
 
-# ═══════════ VIP МОНИТОРИНГ ═══════════
-async def vip_monitor_loop(app):
-    global vip_on, watch_set
+# ═══════════ WEB SERVER (AIOHTTP) ═══════════
+async def serve_static(request):
+    path = request.match_info['path']
+    if ".." in path: return web.Response(status=403)
     
-    while True:
-        if not vip_on or not watch_set:
-            await asyncio.sleep(5)
-            continue
-            
-        for username in list(watch_set):
-            if not vip_on: break
-            
-            # VIP проверяем реже, но тщательнее
-            is_free = await fast_check_http(username)
-            if is_free:
-                verified = await verify_with_telethon(username)
-                if verified:
-                    msg = f"🚨 VIP DROP DETECTED:\n@{username}\n⚡ GRAB IT NOW!"
-                    print(msg)
-                    try:
-                        await app.bot.send_message(OWNER_ID, msg, parse_mode=ParseMode.HTML)
-                    except: pass
-                    # Убираем из списка, чтобы не спамить одним и тем же
-                    watch_set.discard(username)
-                    save_watch()
-            
-            await asyncio.sleep(random.uniform(3, 6)) # Пауза между VIP проверками
-
-# ═══════════ ХРАНЕНИЕ ДАННЫХ ═══════════
-def save_found():
-    with open(FOUND_FILE, "w") as f:
-        json.dump(list(found_set), f)
-
-def load_found():
-    global found_set
-    if os.path.exists(FOUND_FILE):
-        with open(FOUND_FILE) as f:
-            found_set = set(json.load(f))
-
-def save_watch():
-    with open(WATCH_FILE, "w") as f:
-        json.dump(list(watch_set), f)
-
-def load_watch():
-    global watch_set
-    if os.path.exists(WATCH_FILE):
-        with open(WATCH_FILE) as f:
-            watch_set = set(json.load(f))
-    else:
-        # Дефолтный VIP список
-        watch_set = {"admin", "crypto", "ton", "btc", "eth", "sol", "doge", "nft", "game", "news"}
-        save_watch()
-
-# ═══════════ TELEGRAM КОМАНДЫ ═══════════
-async def cmd_start(update, context):
-    if update.effective_user.id != OWNER_ID: return
-    status_hunt = "🟢 ON" if auto_on else "🔴 OFF"
-    status_vip = "🟢 ON" if vip_on else "🔴 OFF"
+    file_path = os.path.join('web', path)
+    if not os.path.exists(file_path) or not os.path.isfile(file_path):
+        return web.Response(status=404)
     
-    text = (
-        f"<b>⚡ ULTRA HUNTER CORE</b>\n\n"
-        f"Hunter Status: <b>{status_hunt}</b>\n"
-        f"VIP Monitor: <b>{status_vip}</b>\n\n"
-        f"Stats:\n"
-        f"• Checked: {check_counter}\n"
-        f"• Found: {len(found_set)}\n"
-        f"• Watching: {len(watch_set)}\n\n"
-        f"Commands:\n"
-        f"/on - Start Hunter\n"
-        f"/off - Stop Hunter\n"
-        f"/vip on/off - Toggle VIP\n"
-        f"/add user - Add to VIP\n"
-        f"/del user - Remove from VIP\n"
-        f"/list - Show found names"
+    mime_types = {'.html':'text/html', '.css':'text/css', '.js':'application/javascript'}
+    ext = os.path.splitext(file_path)[1]
+    ctype = mime_types.get(ext, 'text/plain')
+    
+    with open(file_path, 'rb') as f:
+        content = f.read()
+    return web.Response(body=content, content_type=ctype)
+
+async def api_stats(request):
+    return web.json_response({
+        "checked_count": check_counter,
+        "found_count": len(found_set),
+        "auto_on": auto_on,
+        "watch_list": list(watch_set)
+    })
+
+async def api_command(request):
+    data = await request.json()
+    cmd = data.get('command', '')
+    
+    if '/on' in cmd:
+        global auto_on
+        auto_on = True
+        print(">>> HUNT STARTED VIA WEBAPP")
+    elif '/off' in cmd:
+        auto_on = False
+        print(">>> HUNT STOPPED VIA WEBAPP")
+    elif '/add' in cmd:
+        parts = cmd.split()
+        if len(parts) > 1:
+            name = parts[1].lstrip('@').lower()
+            watch_set.add(name)
+            save_watch()
+            
+    return web.json_response({"success": True})
+
+# ═══════════ TELEGRAM BOT HANDLERS ═══════════
+async def start(update, context):
+    user_id = update.effective_user.id
+    
+    # ⚠️ ВАЖНО: Здесь должен быть твой IP или Ngrok ссылка
+    # Для теста локально оставим localhost, но потом заменим
+    mini_app_url = "http://localhost:8080" 
+    
+    keyboard = [[
+        InlineKeyboardButton("💎 ОТКРЫТЬ DASHBOARD", web_app={"url": mini_app_url})
+    ]]
+    
+    msg = (
+        "<b>✨ USERNAME HUNTER PRO</b>\n\n"
+        "Нажми кнопку ниже, чтобы открыть панель управления.\n"
+        "Там ты увидишь статистику, запустишь поиск и добавишь VIP имена."
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
-async def cmd_on(update, context):
-    global auto_on
-    if update.effective_user.id != OWNER_ID: return
-    auto_on = True
-    await update.message.reply_text("🚀 HUNTER STARTED")
-    print(">>> HUNTER ACTIVE <<<")
-
-async def cmd_off(update, context):
-    global auto_on
-    if update.effective_user.id != OWNER_ID: return
-    auto_on = False
-    await update.message.reply_text("🛑 HUNTER STOPPED")
-    print(">>> HUNTER INACTIVE <<<")
-
-async def cmd_vip(update, context):
-    global vip_on
-    if update.effective_user.id != OWNER_ID: return
-    if len(context.args) < 1:
-        await update.message.reply_text("Use: /vip on or /vip off")
-        return
-    action = context.args[0].lower()
-    if action == "on":
-        vip_on = True
-        await update.message.reply_text("👁️ VIP MONITOR STARTED")
-    elif action == "off":
-        vip_on = False
-        await update.message.reply_text("👁️ VIP MONITOR STOPPED")
-
-async def cmd_add(update, context):
-    if update.effective_user.id != OWNER_ID or not context.args: return
-    username = context.args[0].lstrip("@").lower()
-    watch_set.add(username)
-    save_watch()
-    await update.message.reply_text(f"✅ Added @{username} to VIP watchlist")
-
-async def cmd_del(update, context):
-    if update.effective_user.id != OWNER_ID or not context.args: return
-    username = context.args[0].lstrip("@").lower()
-    if username in watch_set:
-        watch_set.remove(username)
-        save_watch()
-        await update.message.reply_text(f"🗑 Removed @{username}")
-    else:
-        await update.message.reply_text("❌ Not in list")
-
-async def cmd_list(update, context):
-    if update.effective_user.id != OWNER_ID: return
-    if not found_set:
-        await update.message.reply_text("Empty.")
-        return
-    items = sorted(list(found_set))[-20:] # Last 20
-    text = "\n".join([f"@{u}" for u in items])
-    await update.message.reply_text(f"Latest Finds:\n{text}")
-
-# ═══════════ MAIN INITIALIZATION ═══════════
+# ═══════════ MAIN ENTRY POINT ═══════════
 async def main():
     global tg_client
     
-    # 1. Init Telethon Client (For verification)
+    # 1. Init Telethon
     tg_client = TelegramClient('session_hunter', API_ID, API_HASH)
-    await tg_client.start(bot_token=BOT_TOKEN) # Login as bot first? No, need USER session for some checks?
-    # WAIT: To check availability accurately via API, we often need a USER account session.
-    # Bot accounts have limited visibility. 
-    # SOLUTION: We rely on Hybrid HTTP + Bot API resolution. 
-    # If strict accuracy needed, replace 'session_hunter' with your personal phone number login code here.
-    # For now, let's assume Bot token works for basic get_entity which is enough for "Taken vs Not Found".
-    
-    print("Connecting Telethon...")
-    await tg_client.connect()
-    if not await tg_client.is_user_authorized():
-        print("WARNING: Telethon not authorized. Verification will fallback to HTTP only.")
+    await tg_client.start(bot_token=BOT_TOKEN)
     
     # 2. Load Data
-    load_found()
-    load_watch()
+    load_data()
     
-    # 3. Init Pyrogram/PTB App
-    app = Application.builder().token(BOT_TOKEN).build()
+    # 3. Setup AIOHTTP Server (for WebApp)
+    app_web = web.Application()
+    # Маршруты для статики
+    app_web.router.add_get('/{path:.+}', serve_static)
+    # API маршруты
+    app_web.router.add_post('/api/command', api_command)
+    app_web.router.add_get('/api/stats', api_stats)
     
-    # Handlers
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("on", cmd_on))
-    app.add_handler(CommandHandler("off", cmd_off))
-    app.add_handler(CommandHandler("vip", cmd_vip))
-    app.add_handler(CommandHandler("add", cmd_add))
-    app.add_handler(CommandHandler("del", cmd_del))
-    app.add_handler(CommandHandler("list", cmd_list))
+    runner = web.AppRunner(app_web)
+    await runner.setup()
+    site = web.TCPSite(runner, host='0.0.0.0', port=PORT)
+    await site.start()
+    print(f"🌐 WebServer running on http://0.0.0.0:{PORT}")
     
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
+    # 4. Setup PTB Bot
+    app_bot = Application.builder().token(BOT_TOKEN).build()
+    app_bot.add_handler(CommandHandler("start", start))
     
-    print("="*40)
-    print(" SYSTEM READY")
-    print(f"Found DB size: {len(found_set)}")
-    print(f"Watch List size: {len(watch_set)}")
-    print("="*40)
+    await app_bot.initialize()
+    await app_bot.start()
+    await app_bot.updater.start_polling()
     
-    # Run loops concurrently
+    print(" SYSTEM READY. Open Telegram and click /start")
+    
+    # 5. Run Loops Concurrently
     await asyncio.gather(
-        hunter_loop(app),
-        vip_monitor_loop(app)
+        hunter_loop(app_bot)
     )
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nShutting down...")

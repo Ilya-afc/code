@@ -18,8 +18,11 @@ DATA_FILE = "usernames.json"
 FOUND_FILE = "found.json"
 SUBS_FILE = "subs.json"
 REF_FILE = "referrals.json"
-CHECK_INTERVAL = 300
-PAUSE = 3
+
+# ⚙️ НАСТРОЙКИ
+AUTO_STOP_LIMIT = 7      # Автостоп после 7 найденных юзов
+NIGHT_PAUSE = 4          # Пауза для ночи (секунды)
+DAY_PAUSE = 2            # Пауза для дня (секунды)
 
 client = TelegramClient('session', API_ID, API_HASH)
 crypto_session = None
@@ -28,8 +31,10 @@ notified = set()
 tried = set()
 cooldown = {}
 auto_on = False
+auto_found_count = 0
 _last_chk = 0
 app_global = None
+current_pause = DAY_PAUSE
 
 PLANS = {
     "1h":   {"name": "1 час",     "rub": 10,  "stars": 5,   "delta": timedelta(hours=1)},
@@ -89,7 +94,6 @@ def candidate():
     if best: return best, True
     return _word(), True
 
-# ═══════════ ХРАНЕНИЕ ДАННЫХ ═══════════
 def load(p):
     if os.path.exists(p):
         with open(p) as f: return json.load(f)
@@ -155,22 +159,12 @@ def sub_status(uid):
         return f"⏳ <b>Осталось: {days}д {hours}ч {minutes}м</b>\n Истекает: {d.strftime('%d.%m.%Y %H:%M')}"
     except: return "❓ <b>Неизвестно</b>"
 
-def require_sub(fn):
-    async def w(u,c):
-        if not is_sub(u.effective_user.id):
-            await reply(u, f" <b>Нужна подписка</b>\n{LINE}\n💎 Оформить: /subscribe\n👥 Или пригласи друга: /ref")
-            return
-        return await fn(u,c)
-    return w
-
-# ═══════════ УМНАЯ РЕФЕРАЛЬНАЯ СИСТЕМА С КАПЧЕЙ ═══════════
 def generate_captcha():
-    """Генерирует простой математический пример"""
     a = random.randint(2, 15)
     b = random.randint(2, 15)
     op = random.choice(['+', '-'])
     if op == '-' and a < b:
-        a, b = b, a  # Чтобы не было отрицательных чисел
+        a, b = b, a
     answer = a + b if op == '+' else a - b
     return f"{a} {op} {b}", answer
 
@@ -184,51 +178,34 @@ def get_ref_code(uid):
     return code
 
 def add_referral(ref_code, new_uid):
-    """Друг перешёл по ссылке — создаём капчу"""
     if ref_code not in referrals:
         return False, "Неверная ссылка"
-    
     ref_data = referrals[ref_code]
     owner_id = ref_data["owner_id"]
-    
     if new_uid in ref_data["invited"] or str(new_uid) in ref_data.get("pending", {}):
         return False, "Вы уже участвуете"
-    
     if new_uid == owner_id:
         return False, "Сам себя пригласить нельзя"
-    
-    # Генерируем капчу для этого пользователя
     question, answer = generate_captcha()
     if "pending" not in ref_data:
         ref_data["pending"] = {}
-    ref_data["pending"][str(new_uid)] = {
-        "answer": answer,
-        "question": question,
-        "attempts": 0
-    }
+    ref_data["pending"][str(new_uid)] = {"answer": answer, "question": question, "attempts": 0}
     save(REF_FILE, referrals)
-    
     return True, owner_id
 
 def check_captcha(ref_code, new_uid, user_answer):
-    """Проверяет ответ капчи"""
     if ref_code not in referrals:
         return False, "Неверная ссылка"
-    
     ref_data = referrals[ref_code]
     owner_id = ref_data["owner_id"]
-    
     if str(new_uid) not in ref_data.get("pending", {}):
         return False, "Капча не найдена"
-    
     captcha_data = ref_data["pending"][str(new_uid)]
     try:
         user_answer = int(user_answer)
     except:
         return False, "Неверный формат"
-    
     if user_answer == captcha_data["answer"]:
-        # Капча решена верно!
         del ref_data["pending"][str(new_uid)]
         ref_data["invited"].append(new_uid)
         ref_data["total_earned"] = ref_data.get("total_earned", 0) + 1
@@ -241,107 +218,67 @@ def check_captcha(ref_code, new_uid, user_answer):
         if captcha_data["attempts"] >= 3:
             del ref_data["pending"][str(new_uid)]
             save(REF_FILE, referrals)
-            return False, "❌ Превышено количество попыток. Попросите новую ссылку."
+            return False, "❌ Превышено количество попыток."
         return False, f"❌ Неверно! Осталось попыток: {3 - captcha_data['attempts']}"
 
 def get_ref_stats(uid):
     for code, data in referrals.items():
         if data.get("owner_id") == uid:
-            return {
-                "code": code,
-                "invited_count": len(data.get("invited", [])),
-                "pending_count": len(data.get("pending", {})),
-                "total_earned": data.get("total_earned", 0)
-            }
+            return {"code": code, "invited_count": len(data.get("invited", [])), "pending_count": len(data.get("pending", {})), "total_earned": data.get("total_earned", 0)}
     return None
 
 # ═══════════ КНОПКИ ═══════════
 def kb(uid):
     rows = [
-        [InlineKeyboardButton("🎲 Генератор", callback_data="gen"),
-         InlineKeyboardButton("🔄 Авто-проверка 5 шт", callback_data="autocheck")],
-        [InlineKeyboardButton("💎 Подписка", callback_data="sub"),
-         InlineKeyboardButton("📊 Профиль", callback_data="profile")],
-        [InlineKeyboardButton("💎 Мои находки", callback_data="myfound"),
-         InlineKeyboardButton("👥 Рефералы", callback_data="ref")],
+        [InlineKeyboardButton("🎲 Генератор", callback_data="gen"), InlineKeyboardButton("🔄 Авто-проверка 5 шт", callback_data="autocheck")],
+        [InlineKeyboardButton("💎 Подписка", callback_data="sub"), InlineKeyboardButton("📊 Профиль", callback_data="profile")],
+        [InlineKeyboardButton("💎 Мои находки", callback_data="myfound"), InlineKeyboardButton("👥 Рефералы", callback_data="ref")],
     ]
-    if uid == OWNER_ID:
-        rows.append([InlineKeyboardButton(" Автостоп" if auto_on else "🚀 Автостарт (ФОН)", callback_data="auto")])
-    rows.append([InlineKeyboardButton("📩 Связь с разработчиком", url=OWNER_LINK)])
+    if uid == OWNER_ID and not auto_on:
+        rows.append([InlineKeyboardButton("🚀 Автостарт", callback_data="auto")])
+    rows.append([InlineKeyboardButton("📩 Связь", url=OWNER_LINK)])
     return InlineKeyboardMarkup(rows)
 
+def auto_stop_kb():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Остановить автостарт", callback_data="autostop")]])
+
 def plans_kb():
-    rows = []
-    for k,p in PLANS.items():
-        rows.append([InlineKeyboardButton(f"{p['name']} · {p['rub']}₽ / {p['stars']}⭐", callback_data=f"pay_{k}")])
+    rows = [[InlineKeyboardButton(f"{p['name']} · {p['rub']}₽ / {p['stars']}⭐", callback_data=f"pay_{k}")] for k,p in PLANS.items()]
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="back")])
     return InlineKeyboardMarkup(rows)
 
 def pay_method_kb(plan):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💳 CryptoBot", callback_data=f"m_crypto_{plan}"),
-         InlineKeyboardButton("⭐ Stars", callback_data=f"m_stars_{plan}")],
-        [InlineKeyboardButton("◀️ Назад", callback_data="sub")]
-    ])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("💳 CryptoBot", callback_data=f"m_crypto_{plan}"), InlineKeyboardButton("⭐ Stars", callback_data=f"m_stars_{plan}")], [InlineKeyboardButton("◀️ Назад", callback_data="sub")]])
 
 def profile_kb(uid):
     if uid == OWNER_ID:
-        return InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="back")]])
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💎 Оформить", callback_data="sub")],
-        [InlineKeyboardButton("◀️ Назад", callback_data="back")]
-    ])
+        return InlineKeyboardMarkup([[InlineKeyboardButton("️ Назад", callback_data="back")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("💎 Оформить", callback_data="sub")], [InlineKeyboardButton("◀️ Назад", callback_data="back")]])
 
 def ref_kb(uid):
     stats = get_ref_stats(uid)
-    if stats:
-        link = f"https://t.me/{app_global.bot.username}?start={stats['code']}"
-    else:
-        link = f"https://t.me/{app_global.bot.username}?start=ref"
+    link = f"https://t.me/{app_global.bot.username}?start={stats['code']}" if stats else f"https://t.me/{app_global.bot.username}?start=ref"
+    return InlineKeyboardMarkup([[InlineKeyboardButton("📋 Скопировать", url=link)], [InlineKeyboardButton("◀️ Назад", callback_data="back")]])
+
+def found_filter_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 Скопировать ссылку", url=link)],
-        [InlineKeyboardButton("◀️ Назад", callback_data="back")]
+        [InlineKeyboardButton("⭐ Все", callback_data="filter_all"), InlineKeyboardButton("💎 6 букв", callback_data="filter_6")],
+        [InlineKeyboardButton("🔥 5 букв", callback_data="filter_5"), InlineKeyboardButton("◀️ Назад", callback_data="back")]
     ])
 
-HELP = ("❓ <b>Справка</b>\n"+LINE+"\n"
-        "🎲 <code>/gen 10</code> — сгенерировать юзы (по подписке)\n"
-        "🔄 <b>Авто-проверка</b> — проверит 5 юзов\n"
-        "🔍 <code>/check name</code> — проверить 1 юз (бесплатно)\n"
-        "💎 <code>/subscribe</code> — оформить подписку\n"
-        " <code>/ref</code> — пригласить друга +1 час\n"
-        " <code>/profile</code> — мой профиль\n\n"
-        f"👤 Разработчик: <a href=\"{OWNER_LINK}\">@faluoo</a>")
+def rate_kb(username):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⭐ Оценить", callback_data=f"rate_{username}")], [InlineKeyboardButton("◀️ Назад", callback_data="myfound")]])
 
-def do_gen(n):
-    seen=[]; guard=0
-    while len(seen)<n and guard<n*50:
-        guard+=1
-        w,ok=candidate()
-        if ok and w not in seen: seen.append(w)
-    body="\n".join(f"• <code>{w}</code> · {len(w)} букв" for w in seen)
-    return f" <b>Сгенерировано {len(seen)}:</b>\n{LINE}\n{body}"
-
-def do_found():
-    if not found: return "💎 <b>Пока ничего не найдено.</b>"
-    last=found[-30:]
-    return f"💎 <b>Найдено: {len(found)}</b>\n{LINE}\n"+"\n".join(f"{i}. <code>@{w}</code> · {len(w)}б" for i,w in enumerate(last,1))
-
-# ═══════════ БЫСТРАЯ ПРОВЕРКА (БЕЗ ПРОКСИ) ═══════════
+# ═══════════ БЫСТРАЯ ПРОВЕРКА ═══════════
 async def init_http():
     global http_session
     if not http_session:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
-        }
-        timeout = aiohttp.ClientTimeout(total=5)
-        http_session = aiohttp.ClientSession(headers=headers, timeout=timeout)
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept-Language": "ru-RU"}
+        http_session = aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=5))
 
 async def check1(n):
-    """Быстрая проверка через HTML t.me"""
     global http_session
     if not http_session: await init_http()
-    
     url = f"https://t.me/{n}"
     try:
         async with http_session.get(url, allow_redirects=True) as resp:
@@ -351,11 +288,10 @@ async def check1(n):
             if 'property="og:title"' in text or 'tgme_page_title' in text:
                 return False
             return False
-    except Exception as e:
-        print(f"⚠️ Ошибка проверки {n}: {e}")
+    except:
         return None
 
-# ═══════════ CRYPTOBOT ══════════
+# ══════════ CRYPTOBOT ═══════════
 async def crypto_init():
     global crypto_session
     if not CRYPTO_BOT_TOKEN:
@@ -391,7 +327,6 @@ async def crypto_poller(app):
                 text = await resp.text()
                 if not text.startswith("{"): await asyncio.sleep(10); continue
                 data = json.loads(text)
-                
             for inv in (data.get("result",{}).get("items",[]) if data.get("ok") else []):
                 iid = inv["invoice_id"]
                 if iid in seen_inv or inv.get("status") != "paid": continue
@@ -414,46 +349,26 @@ async def start(u,c):
     user = u.effective_user
     uid = user.id
     
-    # Обработка реферальной ссылки с капчей
     if c.args and c.args[0]:
         ref_code = c.args[0]
         if ref_code != "ref":
             success, result = add_referral(ref_code, uid)
             if success:
                 owner_id = result
-                # Получаем вопрос капчи
                 ref_data = referrals[ref_code]
-                captcha = ref_data["pending"][str(uid)]
-                question = captcha["question"]
-                
-                msg = (f"👋 <b>Привет!</b>\n\n"
-                       f"Вы перешли по приглашению!\n\n"
-                       f"🤖 <b>Проверка на бота:</b>\n"
-                       f"Решите пример: <code>{question} = ?</code>\n\n"
-                       f"Просто отправьте ответ числом (например: <code>10</code>)\n"
-                       f"У вас есть 3 попытки! ⏰")
+                question = ref_data["pending"][str(uid)]["question"]
+                msg = f"👋 <b>Привет!</b>\n\n🤖 <b>Проверка на бота:</b>\nРешите пример: <code>{question} = ?</code>\n\nПросто отправьте ответ числом. У вас 3 попытки!"
                 await reply(u, msg)
-                
                 try:
-                    await app_global.bot.send_message(owner_id, 
-                        f"🔔 <b>Новый реферал!</b>\n"
-                        f"Пользователь {uid} перешел по вашей ссылке.\n"
-                        f"⏳ Бонус +1 час будет начислен после решения капчи.", 
-                        parse_mode="HTML")
+                    await app_global.bot.send_message(owner_id, f"🔔 <b>Новый реферал!</b>\nПользователь {uid} ожидает капчу.", parse_mode="HTML")
                 except: pass
                 return
 
-    # Авто-лайфтайм для coldeev
     if user.username and user.username.lower() == GIFT_USERNAME.lower() and not subs.get(str(user.id)):
         grant(user.id, "life")
         await app_global.bot.send_message(OWNER_ID, f"🎁 Авто-лайфтайм выдан @{user.username}", parse_mode="HTML")
     
-    txt = (f"✨ <b>USERNAME HUNTER</b>\n{LINE}\n"
-           "Генерирую красивые юзы типа flouroo, falou\n\n"
-           " <b>Бесплатно:</b> /check\n"
-           "💎 <b>Подписка:</b> /gen, автопоиск\n"
-           "👥 <b>Рефералка:</b> +1 час за друга\n\n"
-           f"👇 Кнопки ниже!")
+    txt = f"✨ <b>USERNAME HUNTER</b>\n{LINE}\nГенерирую красивые юзы\n\n🆓 <b>Бесплатно:</b> /check\n💎 <b>Подписка:</b> /gen, автопоиск\n👥 <b>Рефералка:</b> +1 час за друга\n\n👇 Кнопки ниже!"
     await reply(u, txt, kb(user.id))
 
 async def gen(u,c):
@@ -461,41 +376,38 @@ async def gen(u,c):
     if c.args:
         try: n=max(1,min(20,int(c.args[0])))
         except: pass
-    
-    if not is_sub(u.effective_user.id):
-        if n > 5:
-            await reply(u, f" <b>Нужна подписка</b>\n{LINE}\nБез подписки доступно только 5 юзов.\n💎 Оформить: /subscribe")
-            n = 5
-    
+    if not is_sub(u.effective_user.id) and n > 5:
+        await reply(u, f" <b>Нужна подписка</b>\nБез подписки доступно 5 юзов.")
+        n = 5
     await reply(u, do_gen(n))
 
 async def check(u,c):
     global _last_chk
     if not c.args: return await reply(u,"🔍 Укажи юз: /check flouroo")
     uid=u.effective_user.id; now=time.time()
-    if now-cooldown.get(uid,0)<10:
-        return await reply(u,f"⏳ Подожди {int(10-(now-cooldown[uid]))} сек")
+    if now-cooldown.get(uid,0)<USER_COOLDOWN:=8:
+        return await reply(u,f"⏳ Подожди {int(8-(now-cooldown[uid]))} сек")
     n=c.args[0].lstrip("@").lower()
     if not re.fullmatch(r"[a-z0-9_]{4,32}",n):
         return await reply(u,"⚠️ Некорректное имя")
     cooldown[uid]=now
     _last_chk=time.time()
-    
     m = await reply(u, f"🔍 Проверяю @{n}...")
     f = await check1(n)
-    
-    if f: txt=f"🟢 <b>@{n}</b> — СВОБОДЕН!"
-    elif f is None: txt=f"⚪️ Ошибка проверки"
-    else: txt=f"🔴 <b>@{n}</b> — ЗАНЯТ"
+    txt = f" <b>@{n}</b> — СВОБОДЕН!" if f else (f"⚪️ Ошибка" if f is None else f"🔴 <b>@{n}</b> — ЗАНЯТ")
     await m.edit_text(txt, parse_mode="HTML")
 
 async def subscribe(u,c): await reply(u, f"💎 Тарифы:\n{LINE}", plans_kb())
 
 async def profile(u,c):
     uid = u.effective_user.id
-    await reply(u, f"📊 Профиль\n{LINE}\n👤 ID: <code>{uid}</code>\n\n{sub_status(uid)}", profile_kb(uid))
+    await reply(u, f"📊 <b>Профиль</b>\n{LINE}\n👤 ID: <code>{uid}</code>\n\n{sub_status(uid)}", profile_kb(uid))
 
-async def myfound(u,c): await reply(u, do_found())
+async def myfound(u,c):
+    if u.effective_user.id != OWNER_ID:
+        await reply(u, do_found())
+    else:
+        await reply(u, f" <b>Мои находки: {len(found)}</b>\n{LINE}\nНажми фильтр для сортировки.", found_filter_kb())
 
 async def ref(u,c):
     uid = u.effective_user.id
@@ -503,18 +415,33 @@ async def ref(u,c):
     if not stats:
         code = get_ref_code(uid)
         stats = get_ref_stats(uid)
-    
     link = f"https://t.me/{app_global.bot.username}?start={stats['code']}"
-    text = (f"👥 <b>Реферальная программа</b>\n{LINE}\n\n"
-            f"⏰ <b>+1 час</b> за каждого друга!\n\n"
-            f" <b>Ваша статистика:</b>\n"
-            f"• Приглашено друзей: <b>{stats['invited_count']}</b>\n"
-            f"• Ожидают капчу: <b>{stats.get('pending_count', 0)}</b>\n"
-            f"• Заработано часов: <b>{stats['total_earned']}</b>\n\n"
-            f"📎 <b>Ваша ссылка:</b>\n<code>{link}</code>\n\n"
-            f"<i>🤖 Бонус начисляется, когда друг решит математическую капчу.</i>")
-    
+    text = f" <b>Рефералка</b>\n{LINE}\n⏰ +1 час за друга!\n\n📊 Статистика:\n• Приглашено: <b>{stats['invited_count']}</b>\n• Ожидают капчу: <b>{stats.get('pending_count', 0)}</b>\n• Заработано: <b>{stats['total_earned']} ч</b>\n\n📎 Ссылка:\n<code>{link}</code>"
     await reply(u, text, ref_kb(uid))
+
+@only
+async def setpause(u,c):
+    """Установка паузы для автостарта"""
+    if not c.args:
+        await reply(u, f"⚙️ <b>Текущая пауза:</b> {current_pause} сек\n\nИспользование:\n<code>/setpause 3</code> — быстро\n<code>/setpause 8</code> — медленно (ночь)")
+        return
+    try:
+        global current_pause
+        current_pause = int(c.args[0])
+        await reply(u, f"✅ Пауза установлена: <b>{current_pause} сек</b>")
+    except:
+        await reply(u, "⚠️ Укажите число от 1 до 30")
+
+@only
+async def rate(u,c):
+    """Оценка юза"""
+    if not c.args:
+        await reply(u, "📊 <b>Оценка юза:</b>\n<code>/rate username</code>")
+        return
+    n = c.args[0].lstrip("@").lower()
+    s = score(n)
+    rating = "💎 РЕДКИЙ" if s >= 8 else ("✨ Хороший" if s >= 5 else "⚪️ Обычный")
+    await reply(u, f"📊 <b>Оценка @{n}</b>\n{LINE}\n• Длина: {len(n)} букв\n• Сложность: {s}/10\n• Статус: {rating}")
 
 @only
 async def add(u,c):
@@ -534,177 +461,201 @@ async def remove(u,c):
 
 @only
 async def autostart(u,c):
-    global auto_on
+    global auto_on, auto_found_count
     if auto_on: return await reply(u,"⚠️ Уже запущен")
-    auto_on=True
-    await reply(u,"🚀 <b>Фоновый автостарт включён!</b>\n💎 Юзы будут сохраняться в 'Мои находки'")
+    auto_on = True
+    auto_found_count = 0
+    await reply(u, f"🚀 <b>Автостарт запущен!</b>\n Пауза: {current_pause} сек\n🛑 Остановится после {AUTO_STOP_LIMIT} находок", auto_stop_kb())
 
 @only
 async def autostop(u,c):
     global auto_on
-    auto_on=False
-    await reply(u,f"🛑 <b>Автостоп</b>\n Найдено за всё время: {len(found)}")
+    auto_on = False
+    await reply(u, f"🛑 <b>Автостоп</b>\n Найдено за сессию: {auto_found_count}\n📂 Всего в базе: {len(found)}")
 
 @only
 async def give(u,c):
     if not c.args or len(c.args)<2: return await reply(u,"/give @user life|1h|1d|7d")
     uname=c.args[0].lstrip("@").lower(); plan=c.args[1].lower()
-    if plan not in PLANS: return await reply(u,"План: 1h/1d|7d/life")
+    if plan not in PLANS: return await reply(u,"План: 1h/1d/7d/life")
     try:
         ent = await client.get_input_entity(uname)
         uid = ent.user_id
     except Exception as e:
         return await reply(u,f"❌ Не нашёл: {e}")
     grant(uid, plan)
-    await reply(u,f"🎁 Выдано @{uname} → {PLANS[plan]['name']}")
+    await reply(u,f" Выдано @{uname} → {PLANS[plan]['name']}")
 
-# ═══════════ ОБРАБОТКА КАПЧИ (TEXT MESSAGE) ═══════════
 async def handle_captcha(u,c):
-    """Обрабатывает текстовые сообщения для проверки капчи"""
     uid = u.effective_user.id
     text = u.message.text.strip()
-    
-    # Проверяем, есть ли у пользователя активная капча
     for ref_code, data in referrals.items():
         if str(uid) in data.get("pending", {}):
-            # Пользователь должен решить капчу!
             success, result = check_captcha(ref_code, uid, text)
-            
             if success:
                 owner_id = result
-                await reply(u, f"✅ <b>Капча решена верно!</b>\n\n"
-                           f"Вы подтвердили, что вы не бот 🎉\n"
-                           f"Вашему другу начислен <b>+1 час</b> подписки!\n\n"
-                           f"Теперь вам доступны все функции бота 👇", kb(uid))
-                
-                # Уведомляем владельца
+                await reply(u, f"✅ <b>Капча решена!</b>\nБонус другу начислен +1 час!", kb(uid))
                 try:
-                    await app_global.bot.send_message(owner_id, 
-                        f"🎉 <b>Бонус получен!</b>\n"
-                        f"Ваш друг {uid} решил капчу.\n"
-                        f"⏰ Вам начислено <b>+1 час</b> подписки!", 
-                        parse_mode="HTML")
+                    await app_global.bot.send_message(owner_id, f"🎉 <b>Бонус!</b>\nДруг {uid} решил капчу.\n⏰ +1 час начислено!", parse_mode="HTML")
                 except: pass
             else:
-                # Ошибка в капче
-                await reply(u, f"{result}\n\n"
-                           f"Попробуйте ещё раз или попросите новую ссылку.")
+                await reply(u, result)
             return
-    
-    # Если капчи нет — обычное сообщение, игнорируем
-    pass
 
 # ═══════════ CALLBACK ═══════════
 async def cb(u,c):
-    global auto_on
-    q=u.callback_query; data=q.data; uid=u.effective_user.id
+    global auto_on, auto_found_count, current_pause
+    q=u.callback_query
+    data=q.data
+    uid=u.effective_user.id
     
-    # Проверка: если у пользователя активная капча, блокируем кнопки
-    for ref_code, data in referrals.items():
-        if str(uid) in data.get("pending", {}):
-            await q.answer("🤖 Сначала решите капчу!", show_alert=True)
-            return
+    # ⚡ МГНОВЕННЫЙ ОТВЕТ (кнопки не лагают)
+    await q.answer()
+    
+    # Проверка капчи
+    for ref_code, data_ref in referrals.items():
+        if str(uid) in data_ref.get("pending", {}):
+            if data not in ["ref", "profile", "back"]:
+                await q.message.reply_text("🤖 <b>Сначала решите капчу!</b>")
+                return
     
     if data=="gen":
         if not is_sub(uid):
-            await q.answer("🔒 Нужна подписка",show_alert=True); return
-        await q.answer()
-        await q.message.reply_text(do_gen(5),parse_mode="HTML")
+            await q.message.reply_text("🔒 <b>Нужна подписка</b>")
+            return
+        await q.message.reply_text(do_gen(5), parse_mode="HTML")
         
     elif data=="autocheck":
         if not is_sub(uid):
-            await q.answer("🔒 Нужна подписка",show_alert=True); return
-        await q.answer()
-        await q.message.reply_text("🔄 <b>Проверяю 5 юзов...</b>\n⏳ Это займёт ~10 секунд", parse_mode="HTML")
-        
+            await q.message.reply_text("🔒 <b>Нужна подписка</b>")
+            return
+        await q.message.reply_text("🔄 Проверяю 5 юзов...")
         results = []
         for _ in range(5):
             w, ok = candidate()
             if not ok: continue
-            await asyncio.sleep(2)
             f = await check1(w)
-            if f: results.append(f"🟢 <code>@{w}</code> — СВОБОДЕН!")
-            else: results.append(f"🔴 <code>@{w}</code> — занят")
-        
-        await q.message.reply_text(f"✅ <b>Результат:</b>\n{LINE}\n" + "\n".join(results), parse_mode="HTML")
+            if f: results.append(f"🟢 <code>@{w}</code>")
+            else: results.append(f"🔴 <code>@{w}</code>")
+            await asyncio.sleep(0.5)
+        await q.message.reply_text("✅ " + "\n".join(results), parse_mode="HTML")
 
     elif data=="sub":
-        await q.answer()
-        await q.message.reply_text(f"💎 <b>Тарифы:</b>\n{LINE}\n\n1ч — 10₽ / 5⭐\n1д — 50₽ / 25⭐\n7д — 100₽ / 50⭐\n♾️ — 500₽ / 250⭐",reply_markup=plans_kb())
+        await q.message.reply_text(f"💎 Тарифы:\n1ч — 10₽\n1д — 50₽\n7д — 100₽\n∞ — 500₽", reply_markup=plans_kb())
+        
     elif data=="profile":
-        await q.answer()
-        await q.message.reply_text(f"📊 <b>Твой профиль</b>\n{LINE}\n👤 ID: <code>{uid}</code>\n\n{sub_status(uid)}", parse_mode="HTML", reply_markup=profile_kb(uid))
+        await q.message.reply_text(f"📊 Профиль\n{sub_status(uid)}", parse_mode="HTML", reply_markup=profile_kb(uid))
+        
     elif data=="myfound":
-        await q.answer()
-        await q.message.reply_text(do_found(), parse_mode="HTML")
+        if uid != OWNER_ID:
+            await q.message.reply_text(do_found(), parse_mode="HTML")
+        else:
+            await q.message.reply_text(f"💎 Найдено: {len(found)}", reply_markup=found_filter_kb())
+        
     elif data=="ref":
-        await q.answer()
         await ref(u,c)
+        
     elif data=="back":
-        await q.answer()
-        await q.message.reply_text(f"✨ <b>USERNAME HUNTER</b>\n{LINE}\nВыбери действие:",parse_mode="HTML",reply_markup=kb(uid))
+        await q.message.reply_text(f"✨ <b>USERNAME HUNTER</b>", parse_mode="HTML", reply_markup=kb(uid))
+        
+    elif data=="autostop":
+        if uid != OWNER_ID: return
+        auto_on = False
+        await q.message.reply_text(f"🛑 <b>Автостоп</b>\nНайдено: {auto_found_count}", reply_markup=kb(uid))
+        
+    elif data.startswith("filter_"):
+        if uid != OWNER_ID: return
+        ftype = data[7:]
+        if ftype == "all":
+            filtered = found[-20:]
+        elif ftype == "6":
+            filtered = [w for w in found[-20:] if len(w) == 6]
+        elif ftype == "5":
+            filtered = [w for w in found[-20:] if len(w) == 5]
+        else:
+            filtered = found[-20:]
+        text = f"💎 <b>Фильтр: {ftype}</b>\n{LINE}\n" + "\n".join(f"<code>@{w}</code> · {len(w)}б · ⭐ {score(w)}" for w in filtered) if filtered else "Пусто"
+        await q.message.reply_text(text, parse_mode="HTML", reply_markup=found_filter_kb())
+        
+    elif data.startswith("rate_"):
+        if uid != OWNER_ID: return
+        username = data[5:]
+        s = score(username)
+        rating = "💎 РЕДКИЙ" if s >= 8 else ("✨ Хороший" if s >= 5 else "⚪️ Обычный")
+        await q.message.reply_text(f"📊 <b>@{username}</b>\n{LINE}\n• Длина: {len(username)}\n• Оценка: {s}/10\n• Статус: {rating}", parse_mode="HTML", reply_markup=rate_kb(username))
+        
     elif data.startswith("pay_"):
-        plan=data[4:]; p=PLANS[plan]; await q.answer()
-        await q.message.reply_text(f" <b>{p['name']}</b>\n{LINE}\n💰 {p['rub']}₽  |  ⭐ {p['stars']} Stars\n\nВыбери способ оплаты:",parse_mode="HTML", reply_markup=pay_method_kb(plan))
+        plan=data[4:]; p=PLANS[plan]
+        await q.message.reply_text(f"💎 {p['name']} — {p['rub']}₽", reply_markup=pay_method_kb(plan))
+        
     elif data.startswith("m_crypto_"):
         plan=data[9:]; p=PLANS[plan]
-        if not CRYPTO_BOT_TOKEN: await q.answer("CryptoBot не настроен",show_alert=True); return
-        await q.answer("Создаю счёт...")
+        if not CRYPTO_BOT_TOKEN:
+            await q.message.reply_text("CryptoBot не настроен")
+            return
         inv=await crypto_create_invoice(p["rub"], f"sub_{uid}_{plan}")
         if inv:
-            await q.message.reply_text(f" <b>Оплати {p['rub']}₽</b>\n{LINE}\n <a href=\"{inv['pay_url']}\">Перейти к оплате</a>\n\nПосле оплаты подписка активируется автоматически.",parse_mode="HTML")
-        else:
-            await q.message.reply_text("❌ Не удалось создать счёт.",parse_mode="HTML")
+            await q.message.reply_text(f"💳 <a href=\"{inv['pay_url']}\">Оплатить {p['rub']}₽</a>", parse_mode="HTML")
+            
     elif data.startswith("m_stars_"):
-        plan=data[8:]; p=PLANS[plan]; await q.answer()
+        plan=data[8:]; p=PLANS[plan]
         try:
-            await q.message.reply_invoice(title=f"Подписка {p['name']}",description=f"Username Hunter — {p['name']}",payload=f"sub_{uid}_{plan}",provider_token="",currency="XTR",prices=[LabeledPrice(label=p["name"], amount=p["stars"])])
+            await q.message.reply_invoice(title=f"Подписка {p['name']}",payload=f"sub_{uid}_{plan}",provider_token="",currency="XTR",prices=[LabeledPrice(label=p["name"], amount=p["stars"])])
         except Exception as e:
-            await q.message.reply_text(f"❌ Stars недоступны: {e}",parse_mode="HTML")
+            await q.message.reply_text(f"❌ Stars: {e}")
+            
     elif data=="auto":
-        if uid!=OWNER_ID: return await q.answer("⛔ Только владелец",show_alert=True)
-        auto_on=not auto_on
-        await q.message.reply_text(f"{'🚀 <b>Автопоиск ВКЛ</b>' if auto_on else '🛑 <b>Автопоиск ВЫКЛ</b>'}",parse_mode="HTML",reply_markup=kb(uid))
+        if uid != OWNER_ID: return
+        auto_on = not auto_on
+        auto_found_count = 0
+        if auto_on:
+            await q.message.reply_text(f"🚀 <b>Автостарт ВКЛ</b>\nПауза: {current_pause} сек\nСтоп после {AUTO_STOP_LIMIT} находок", reply_markup=auto_stop_kb())
+        else:
+            await q.message.reply_text("🛑 <b>Автостоп</b>", reply_markup=kb(uid))
 
 async def precheckout(u,c): await u.pre_checkout_query.answer(ok=True)
-
 async def successful_payment(u,c):
     msg=u.effective_message; payload=msg.successful_payment.invoice_payload
     if payload.startswith("sub_"):
         _,uid,plan=payload.split("_",2); grant(int(uid),plan); p=PLANS[plan]
-        await msg.reply_text(f"✅ <b>Оплата Stars получена!</b>\n{LINE}\n💎 Подписка <b>{p['name']}</b> активирована.\n /profile",parse_mode="HTML")
-        await c.bot.send_message(OWNER_ID,f"⭐ <b>+{p['stars']} Stars</b> от {uid} ({p['name']})",parse_mode="HTML")
+        await msg.reply_text(f"✅ Оплата! {p['name']} активирована.", parse_mode="HTML")
 
-# ═══════════ ФОНОВЫЕ ПРОЦЕССЫ ═══════════
+# ═══════════ ФОН ═══════════
 async def monitor(app):
-    """Проверка твоих сохранённых юзов из /add"""
     while True:
         for n in list(usernames):
             f=await check1(n)
             if f and n not in notified:
                 notified.add(n)
-                await app.bot.send_message(OWNER_ID,f"🎉 <b>@{n} ОСВОБОДИЛСЯ!</b>",parse_mode="HTML")
-            await asyncio.sleep(PAUSE)
+                await app.bot.send_message(OWNER_ID, f"🎉 <b>@{n} ОСВОБОДИЛСЯ!</b>", parse_mode="HTML")
+            await asyncio.sleep(3)
         await asyncio.sleep(CHECK_INTERVAL)
 
 async def searcher(app):
-    """ТВОЙ ЛИЧНЫЙ АВТОСТАРТ - ищет красивые юзы и сохраняет"""
-    global tried
+    global tried, auto_on, auto_found_count, current_pause
     while True:
         if auto_on:
-            cand,ok=candidate()
-            if not ok or cand in tried: 
+            cand, ok = candidate()
+            if not ok or cand in tried:
                 await asyncio.sleep(1)
                 continue
             tried.add(cand)
-            if len(tried)>200000: tried.clear()
-            f=await check1(cand)
+            if len(tried) > 200000: tried.clear()
+            f = await check1(cand)
             if f:
-                found.append(cand); save(FOUND_FILE,found)
-                tag="💎 РЕДКИЙ!" if len(cand)<=6 else "✨ Красивый"
-                await app.bot.send_message(OWNER_ID,f"{tag} <code>@{cand}</code> ({len(cand)}б)",parse_mode="HTML")
-            await asyncio.sleep(3)
-        else: 
+                found.append(cand); save(FOUND_FILE, found)
+                auto_found_count += 1
+                s = score(cand)
+                tag = "💎 РЕДКИЙ!" if s >= 8 else ("✨" if s >= 5 else "")
+                await app.bot.send_message(OWNER_ID, f"{tag} <code>@{cand}</code> ({len(cand)}б) · ⭐ {s}", parse_mode="HTML")
+                
+                # 🛑 АВТОСТОП ПОСЛЕ 7 НАХОДОК
+                if auto_found_count >= AUTO_STOP_LIMIT:
+                    auto_on = False
+                    await app.bot.send_message(OWNER_ID, f"🛑 <b>Автостоп!</b>\nНайдено {AUTO_STOP_LIMIT} юзов за сессию.\nЗапусти /autostart для продолжения.", parse_mode="HTML", reply_markup=kb(OWNER_ID))
+                    
+            await asyncio.sleep(current_pause)
+        else:
             await asyncio.sleep(2)
 
 async def main():
@@ -725,14 +676,17 @@ async def main():
     app.add_handler(CommandHandler("remove", remove))
     app.add_handler(CommandHandler("autostart", autostart))
     app.add_handler(CommandHandler("autostop", autostop))
+    app.add_handler(CommandHandler("setpause", setpause))
+    app.add_handler(CommandHandler("rate", rate))
     app.add_handler(CommandHandler("give", give))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_captcha))  # Обработка капчи
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_captcha))
     app.add_handler(CallbackQueryHandler(cb))
     app.add_handler(PreCheckoutQueryHandler(precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     await app.initialize(); await app.start(); await app.updater.start_polling()
-    print(" Бот запущен (КАПЧА МАТЕМАТИКА)")
-    print(" Рефералы решают примеры для подтверждения")
+    print("🚀 Бот запущен")
+    print(f"⚙️ Автостоп после: {AUTO_STOP_LIMIT} находок")
+    print(f"⏸ Пауза: {current_pause} сек")
     try:
         await asyncio.gather(monitor(app), searcher(app), crypto_poller(app))
     finally:
